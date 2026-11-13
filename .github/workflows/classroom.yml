@@ -1,0 +1,128 @@
+# Standalone GitHub Actions grading. GitHub Classroom is not required.
+# Keep this filename when copying the next lab's workflow into the student repo.
+# The teacher must verify test/workflow integrity at the submitted commit.
+name: ShopLite Lab 2 checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  repository_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install packages
+        working-directory: shoplite
+        run: flutter pub get
+
+      - name: Run all grading groups and publish score
+        id: grading
+        env:
+          GRADING_CONFIG: >-
+            {"lab":2,"directory":"shoplite","groups":[{"id":"g1","name":"Lab 2 · 1. Модель ба өгөгдөл","points":3,"kind":"test","tool":"flutter","arguments":["test","test/lab2_test.dart","--reporter","json","--timeout","5m","--plain-name","1. Модель ба өгөгдөл"],"minimum":1},{"id":"g2","name":"Lab 2 · 2. Туслах функц","points":4,"kind":"test","tool":"flutter","arguments":["test","test/lab2_test.dart","--reporter","json","--timeout","5m","--plain-name","2. Туслах функц"],"minimum":1},{"id":"g3","name":"Lab 2 · 3. RatingStars, PriceTag","points":4,"kind":"test","tool":"flutter","arguments":["test","test/lab2_test.dart","--reporter","json","--timeout","5m","--plain-name","3. RatingStars, PriceTag"],"minimum":1},{"id":"g4","name":"Lab 2 · 4. ProductCard","points":5,"kind":"test","tool":"flutter","arguments":["test","test/lab2_test.dart","--reporter","json","--timeout","5m","--plain-name","4. ProductCard"],"minimum":1},{"id":"g5","name":"Lab 2 · 5. Каталог","points":5,"kind":"test","tool":"flutter","arguments":["test","test/lab2_test.dart","--reporter","json","--timeout","5m","--plain-name","5. Каталог"],"minimum":1},{"id":"g6","name":"Lab 2 · 6. Навигаци ба theme","points":4,"kind":"test","tool":"flutter","arguments":["test","test/lab2_test.dart","--reporter","json","--timeout","5m","--plain-name","6. Навигаци ба theme"],"minimum":1}]}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $config = $env:GRADING_CONFIG | ConvertFrom-Json
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE '.grading-results'
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+          $rows = @()
+          foreach ($group in $config.groups) {
+            $logPath = Join-Path $outputDir ($group.id + '.log')
+            $passed = $false
+            $count = 0
+            $detail = ''
+            Write-Output "::group::$($group.name)"
+            try {
+              Push-Location (Join-Path $env:GITHUB_WORKSPACE $config.directory)
+              try {
+                $arguments = @($group.arguments)
+                & $group.tool @arguments 2>&1 | Tee-Object -FilePath $logPath
+                $commandExit = $LASTEXITCODE
+              } finally { Pop-Location }
+              if ($group.kind -eq 'analyze') {
+                $passed = $commandExit -eq 0
+                $detail = "exit=$commandExit"
+              } else {
+                $events = @(Get-Content -LiteralPath $logPath | ForEach-Object {
+                  try { ConvertFrom-Json -InputObject $_ -ErrorAction Stop } catch { }
+                })
+                $completed = @($events | Where-Object { $_.type -eq 'testDone' -and -not $_.hidden })
+                $count = $completed.Count
+                $bad = @($completed | Where-Object { $_.result -ne 'success' -or $_.skipped })
+                $errors = @($events | Where-Object { $_.type -eq 'error' })
+                $done = @($events | Where-Object { $_.type -eq 'done' })
+                $finished = $done.Count -gt 0 -and $done[-1].success -eq $true
+                $passed = $commandExit -eq 0 -and $finished -and $count -ge $group.minimum -and $bad.Count -eq 0 -and $errors.Count -eq 0
+                $detail = "tests=$count; failed/skipped=$($bad.Count); errors=$($errors.Count); exit=$commandExit"
+              }
+            } catch {
+              $detail = $_.Exception.Message
+              Write-Output $detail
+            }
+            $earned = if ($passed) { $group.points } else { 0 }
+            $rows += [pscustomobject]@{
+              group = $group.name; passed = $passed; tests = $count
+              earned = $earned; maximum = $group.points; detail = $detail
+            }
+            Write-Output "$earned / $($group.points) -- $detail"
+            Write-Output '::endgroup::'
+          }
+          $earnedTotal = ($rows | Measure-Object -Property earned -Sum).Sum
+          $maxTotal = ($rows | Measure-Object -Property maximum -Sum).Sum
+          $report = [ordered]@{
+            lab = $config.lab; repository = $env:GITHUB_REPOSITORY
+            ref = $env:GITHUB_REF; commit = $env:GITHUB_SHA
+            run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            earned = $earnedTotal; maximum = $maxTotal; groups = $rows
+          }
+          $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $outputDir 'results.json') -Encoding utf8
+          $rows | Export-Csv -LiteralPath (Join-Path $outputDir 'results.csv') -NoTypeInformation -Encoding utf8
+          $summary = @(
+            "## Lab $($config.lab): $earnedTotal / $maxTotal",
+            "Commit: ``$env:GITHUB_SHA``", '',
+            '| Group | Result | Tests | Score |', '|---|---|---:|---:|'
+          )
+          foreach ($row in $rows) {
+            $status = if ($row.passed) { 'PASS' } else { 'FAIL' }
+            $summary += "| $($row.group) | $status | $($row.tests) | $($row.earned) / $($row.maximum) |"
+          }
+          $summary += @('', 'Automatic checks support teacher assessment; they are not the final course grade.')
+          $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          if (@($rows | Where-Object { -not $_.passed }).Count -gt 0) { exit 1 }
+
+      - name: Report setup failure
+        if: ${{ failure() && steps.grading.outcome == 'skipped' }}
+        run: |
+          '## Grading could not start' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          'Dependency or environment setup failed. Review the logs; no score was awarded.' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+
+      - name: Save grading report and test logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-2-grading-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .grading-results/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 30
